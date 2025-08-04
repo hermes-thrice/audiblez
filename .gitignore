@@ -5,6 +5,7 @@ chapters.txt
 .DS_Store
 *.pyc
 *.wav
+*.m4b
 *.mp3
 *.epub
 *.sh

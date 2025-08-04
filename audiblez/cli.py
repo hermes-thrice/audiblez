@@ -36,7 +36,19 @@ def cli_main():
             print('CUDA GPU not available. Defaulting to CPU')
 
     from core import main
-    main(args.epub_file_path, args.voice, args.pick, args.speed, args.output)
+    
+    # Custom opening and closing credits for Alexandria/Spark Visions
+    opening_credits = ("This audiobook is presented by Alexandria, produced by Spark Visions, Inc. "
+                      "This version is licensed under the Creative Commons Attribution 4.0 International License. "
+                      "You are free to share and adapt this material for any purpose, even commercially, "
+                      "provided proper credit is given. Please read the full credits in text versions of this book, "
+                      "freely available on Seek Alexandria dot com")
+    
+    closing_credits = ("That's the end of this audiobook. Thank you so much for listening. "
+                      "Please like this audiobook on Seek Alexandria dot com if you enjoyed it.")
+    
+    main(args.epub_file_path, args.voice, args.pick, args.speed, args.output,
+         opening_credits=opening_credits, closing_credits=closing_credits)
 
 
 if __name__ == '__main__':

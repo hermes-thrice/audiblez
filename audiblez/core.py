@@ -30,6 +30,40 @@ from pick import pick
 sample_rate = 24000
 
 
+def extract_chapter_title_from_content(text):
+    """Extract the actual chapter title from the content"""
+    lines = text.strip().split('\n')
+    for line in lines[:10]:  # Check first 10 lines for a title
+        line = line.strip()
+        # Remove trailing period if it exists for title detection
+        clean_line = line.rstrip('.')
+        # Look for titles that are all caps, reasonably sized, and not too long
+        if (len(clean_line) > 3 and len(clean_line) < 150 and 
+            (clean_line.isupper() or clean_line.istitle()) and
+            not clean_line.startswith('http') and
+            not clean_line.lower().startswith('chapter')):
+            return clean_line
+    return None
+
+
+def format_chapter_announcement(chapter_title):
+    """Format chapter title for audio announcement - scalable for all book structures"""
+    if chapter_title:
+        # Check if the content title contains chapter number info
+        chapter_pattern = re.match(r'chapter\s+(\d+)[:.]?\s*(.*)', chapter_title, re.IGNORECASE)
+        if chapter_pattern:
+            chapter_num = chapter_pattern.group(1)
+            chapter_name = chapter_pattern.group(2).strip()
+            if chapter_name:
+                return f"Chapter {chapter_num}: {chapter_name}"
+            else:
+                return f"Chapter {chapter_num}"
+        else:
+            # Content title doesn't have chapter number, use "Next Chapter" format
+            return f"Next Chapter: {chapter_title}"
+    return None
+
+
 def load_spacy():
     if not spacy.util.is_package("xx_ent_wiki_sm"):
         print("Downloading Spacy model xx_ent_wiki_sm...")
@@ -70,7 +104,8 @@ def set_espeak_library():
 
 
 def main(file_path, voice, pick_manually, speed, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None):
+         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None,
+         opening_credits=None, closing_credits=None):
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
@@ -117,6 +152,34 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
     pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
 
     chapter_wav_files = []
+    
+    # Always create a title/credits chapter first
+    title_chapter_path = Path(output_folder) / filename.replace(extension, f'_chapter_0_title_{voice}.wav')
+    chapter_wav_files.append(title_chapter_path)
+    if not Path(title_chapter_path).exists():
+        # Create title and credits text
+        intro_parts = []
+        intro_parts.append(f'{title}, by {creator}.')
+        if opening_credits:
+            intro_parts.append('...')  # 1-second pause
+            intro_parts.append(opening_credits)
+        title_text = '\n\n'.join(intro_parts)
+        
+        start_time = time.time()
+        audio_segments = gen_audio_segments(
+            pipeline, title_text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
+        if audio_segments:
+            final_audio = np.concatenate(audio_segments)
+            soundfile.write(title_chapter_path, final_audio, sample_rate)
+            end_time = time.time()
+            delta_seconds = end_time - start_time
+            chars_per_sec = len(title_text) / delta_seconds
+            print('Title chapter written to', title_chapter_path)
+            print(f'Title chapter read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
+    else:
+        print('Title chapter already exists. Skipping')
+    
+    # Process regular chapters
     for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
@@ -133,9 +196,33 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             print(f'Skipping empty chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
             continue
-        if i == 1:
-            # add intro text
-            text = f'{title} – {creator}.\n\n' + text
+        
+        # Add chapter announcement for chapters (not the first one since we have a title chapter)
+        chapter_title = extract_chapter_title_from_content(text)
+        chapter_announcement = format_chapter_announcement(chapter_title)
+        if chapter_announcement:
+            # Add pause after "Next Chapter" and avoid duplication
+            announcement_parts = chapter_announcement.split(': ', 1)
+            if len(announcement_parts) == 2:
+                formatted_announcement = announcement_parts[0] + '.\n\n...\n\n' + announcement_parts[1]
+            else:
+                formatted_announcement = chapter_announcement
+            
+            # Remove the title from the beginning of content if it matches to avoid duplication
+            if chapter_title:
+                lines = text.split('\n')
+                first_line = lines[0].strip().rstrip('.')
+                if first_line.upper() == chapter_title.upper():
+                    # Remove the duplicate first line and clean up
+                    remaining_lines = lines[1:]
+                    text = '\n'.join(remaining_lines).strip()
+            
+            text = formatted_announcement + '\n\n...\n\n' + text
+        
+        # Add closing credits to the last chapter with 3-second pause
+        if i == len(selected_chapters) and closing_credits:
+            pause_text = "..." * 10  # Creates a 3-second pause when spoken
+            text = text + '\n\n' + pause_text + '\n\n' + closing_credits
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
@@ -243,7 +330,16 @@ def find_document_chapters_and_extract_texts(book):
 
 def is_chapter(c):
     name = c.get_name().lower()
-    has_min_len = len(c.extracted_text) > 100
+    text = c.extracted_text.lower()
+    has_min_len = len(c.extracted_text) > 10
+    
+    # Skip licensing, credits, and copyright sections
+    is_licensing = any(keyword in name or keyword in text[:500] for keyword in [
+        'license', 'licensing', 'copyright', 'credits', 'credit', 'attribution',
+        'creative commons', 'cc by', 'public domain', 'legal', 'disclaimer',
+        'acknowledgment', 'acknowledgement'
+    ])
+    
     title_looks_like_chapter = bool(
         'chapter' in name.lower()
         or re.search(r'part_?\d{1,3}', name)
@@ -251,7 +347,7 @@ def is_chapter(c):
         or re.search(r'ch_?\d{1,3}', name)
         or re.search(r'chap_?\d{1,3}', name)
     )
-    return has_min_len and title_looks_like_chapter
+    return has_min_len and title_looks_like_chapter and not is_licensing
 
 
 def chapter_beginning_one_liner(c, chars=20):
