@@ -13,3 +13,6 @@ chapters.txt
 *.onnx
 dist
 .venv
+.env
+pipeline.log
+temp_downloads/
