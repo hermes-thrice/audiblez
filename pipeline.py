@@ -113,6 +113,154 @@ class AudiobookPipeline:
         except Exception as e:
             self.logger.error(f"Failed to upload m4b for slug '{slug}': {e}")
             return None
+    
+    def list_audiobook_folders(self) -> List[str]:
+        """List all folders in the audiobooks bucket"""
+        try:
+            response = self.supabase.storage.from_("audiobooks").list()
+            
+            # Handle case where response might be None or have different structure
+            if not response:
+                self.logger.warning("Empty response from storage list")
+                return []
+            
+            # Filter for folders (items without file extensions and where metadata is None or has no mimetype)
+            folders = []
+            for item in response:
+                if item and isinstance(item, dict):
+                    name = item.get('name', '')
+                    metadata = item.get('metadata')
+                    
+                    # Folders typically don't have file extensions and have metadata=None
+                    # or metadata without mimetype
+                    has_mimetype = False
+                    if metadata and isinstance(metadata, dict):
+                        has_mimetype = bool(metadata.get('mimetype'))
+                    
+                    if name and '.' not in name and not has_mimetype:
+                        folders.append(name)
+            
+            self.logger.info(f"Found {len(folders)} folders in audiobooks bucket: {folders}")
+            return folders
+        except Exception as e:
+            self.logger.error(f"Failed to list audiobook folders: {e}")
+            return []
+    
+    def check_mp3_exists(self, slug: str) -> bool:
+        """Check if MP3 file exists in the audiobooks bucket folder"""
+        try:
+            file_path = f"{slug}/{slug}.mp3"
+            # Try to get file info - if it exists, this won't raise an exception
+            self.supabase.storage.from_("audiobooks").get_public_url(file_path)
+            # Additional check by trying to list the specific file
+            response = self.supabase.storage.from_("audiobooks").list(slug)
+            mp3_files = [item for item in response if item['name'] == f"{slug}.mp3"]
+            return len(mp3_files) > 0
+        except Exception:
+            return False
+    
+    def check_m4b_exists(self, slug: str) -> bool:
+        """Check if M4B file exists in the audiobooks bucket folder"""
+        try:
+            response = self.supabase.storage.from_("audiobooks").list(slug)
+            m4b_files = [item for item in response if item['name'] == f"{slug}.m4b"]
+            return len(m4b_files) > 0
+        except Exception:
+            return False
+    
+    def download_m4b_from_bucket(self, slug: str) -> Optional[Path]:
+        """Download M4B file from audiobooks bucket"""
+        try:
+            file_path = f"{slug}/{slug}.m4b"
+            local_path = self.temp_dir / f"{slug}.m4b"
+            
+            response = self.supabase.storage.from_("audiobooks").download(file_path)
+            
+            with open(local_path, 'wb') as f:
+                f.write(response)
+                
+            self.logger.info(f"Downloaded {file_path} to {local_path}")
+            return local_path
+            
+        except Exception as e:
+            self.logger.error(f"Failed to download M4B for slug '{slug}': {e}")
+            return None
+    
+    def convert_m4b_to_mp3(self, m4b_path: Path) -> Optional[Path]:
+        """Convert M4B file to MP3 using ffmpeg"""
+        try:
+            mp3_path = m4b_path.parent / f"{m4b_path.stem}.mp3"
+            
+            # Use ffmpeg to convert M4B to MP3 with optimized settings for smaller file size
+            command = [
+                'ffmpeg', '-y',  # Overwrite output
+                '-i', str(m4b_path),  # Input M4B file
+                '-c:a', 'mp3',  # Convert to MP3
+                '-b:a', '64k',  # Lower bitrate for smaller files (was 128k)
+                '-ar', '22050',  # Lower sample rate for speech (was default 44100)
+                '-ac', '1',  # Mono audio for speech (was stereo)
+                '-q:a', '4',  # Quality setting (0-9, 4 is good balance)
+                '-f', 'mp3',  # Output format
+                str(mp3_path)  # Output file
+            ]
+            
+            self.logger.info(f"Converting M4B to MP3: {m4b_path} -> {mp3_path}")
+            
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=1800  # 30 minute timeout
+            )
+            
+            if result.returncode == 0 and mp3_path.exists():
+                self.logger.info(f"Successfully converted to MP3: {mp3_path}")
+                return mp3_path
+            else:
+                self.logger.error(f"MP3 conversion failed: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"MP3 conversion timed out for {m4b_path}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to convert M4B to MP3: {e}")
+            return None
+    
+    def upload_mp3_to_bucket(self, slug: str, mp3_path: Path) -> Optional[str]:
+        """Upload MP3 file to audiobooks bucket and return public URL"""
+        try:
+            bucket_path = f"{slug}/{slug}.mp3"
+            
+            # Log file size for debugging
+            file_size = mp3_path.stat().st_size
+            self.logger.info(f"Preparing to upload MP3: {mp3_path} (size: {file_size / (1024*1024):.1f} MB)")
+            
+            self.logger.info(f"Reading MP3 file data...")
+            with open(mp3_path, 'rb') as f:
+                file_data = f.read()
+            
+            self.logger.info(f"File data read successfully, starting upload to {bucket_path}...")
+            
+            # Upload file (this will overwrite if exists)
+            response = self.supabase.storage.from_("audiobooks").upload(
+                bucket_path, file_data, {"upsert": "true"}
+            )
+            
+            self.logger.info(f"Upload response received: {response}")
+            
+            # Get public URL
+            self.logger.info(f"Getting public URL for {bucket_path}...")
+            public_url = self.supabase.storage.from_("audiobooks").get_public_url(bucket_path)
+            
+            self.logger.info(f"Successfully uploaded {mp3_path} to {bucket_path} (public URL: {public_url})")
+            return public_url
+            
+        except Exception as e:
+            self.logger.error(f"Failed to upload MP3 for slug '{slug}': {e}")
+            import traceback
+            self.logger.error(f"Upload error traceback: {traceback.format_exc()}")
+            return None
             
     def update_audiobook_url(self, slug: str, audiobook_url: str) -> bool:
         """Update the audiobook_url column in the books table"""
@@ -131,6 +279,62 @@ class AudiobookPipeline:
         except Exception as e:
             self.logger.error(f"Failed to update audiobook_url for slug '{slug}': {e}")
             return False
+    
+    def update_audiobook_mp3_url(self, slug: str, mp3_url: str) -> bool:
+        """Update the audiobook_mp3_url column in the books table"""
+        try:
+            response = self.supabase.table('books').update({
+                'audiobook_mp3_url': mp3_url
+            }).eq('slug', slug).execute()
+            
+            if response.data:
+                self.logger.info(f"Updated audiobook_mp3_url for slug '{slug}'")
+                return True
+            else:
+                self.logger.warning(f"No book found with slug '{slug}' to update MP3 URL")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to update audiobook_mp3_url for slug '{slug}': {e}")
+            return False
+    
+    def generate_and_upload_mp3(self, slug: str, m4b_path: Path) -> bool:
+        """Generate MP3 from M4B and upload to bucket, update database"""
+        mp3_path = None
+        try:
+            # Step 1: Convert M4B to MP3
+            self.logger.info(f"Converting M4B to MP3 for {slug}")
+            mp3_path = self.convert_m4b_to_mp3(m4b_path)
+            if not mp3_path:
+                self.logger.error(f"Failed to convert M4B to MP3 for {slug}")
+                return False
+            
+            # Step 2: Upload MP3 to bucket
+            self.logger.info(f"Uploading MP3 for {slug}")
+            mp3_url = self.upload_mp3_to_bucket(slug, mp3_path)
+            if not mp3_url:
+                self.logger.error(f"Failed to upload MP3 for {slug}")
+                return False
+            
+            # Step 3: Update database
+            self.logger.info(f"Updating database MP3 URL for {slug}")
+            if not self.update_audiobook_mp3_url(slug, mp3_url):
+                self.logger.error(f"Failed to update database MP3 URL for {slug}")
+                return False
+            
+            self.logger.info(f"Successfully generated and uploaded MP3 for {slug}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error generating MP3 for {slug}: {e}")
+            return False
+            
+        finally:
+            # Clean up temporary MP3 file
+            if mp3_path and mp3_path.exists():
+                mp3_path.unlink()
+                self.logger.info(f"Cleaned up {mp3_path}")
+            # Note: M4B cleanup is handled by the calling function
             
     def generate_audiobook(self, epub_path: Path) -> Optional[Path]:
         """Run audiobook generation command and return path to generated m4b"""
@@ -223,6 +427,12 @@ class AudiobookPipeline:
             if not self.update_audiobook_url(slug, audiobook_url):
                 self.logger.error(f"Failed to update database for {slug}")
                 return False
+            
+            # Step 5: Generate and upload MP3
+            self.logger.info(f"Generating MP3 for {slug}")
+            if not self.generate_and_upload_mp3(slug, m4b_path):
+                self.logger.warning(f"Failed to generate MP3 for {slug}, but M4B was successful")
+                # Don't return False here - M4B generation was successful
                 
             self.logger.info(f"Successfully processed book: {slug}")
             return True
@@ -232,9 +442,21 @@ class AudiobookPipeline:
             return False
             
         finally:
-            # Clean up temporary files
-            if epub_path or m4b_path:
-                self.cleanup_temp_files(epub_path, m4b_path)
+            # Clean up temporary files (but keep M4B until after MP3 generation)
+            if epub_path and epub_path.exists():
+                epub_path.unlink()
+                self.logger.info(f"Cleaned up {epub_path}")
+            
+            # Clean up any remaining wav files
+            if epub_path:
+                for wav_file in epub_path.parent.glob("*.wav"):
+                    wav_file.unlink()
+                    self.logger.info(f"Cleaned up {wav_file}")
+            
+            # M4B cleanup is handled in generate_and_upload_mp3 after MP3 generation
+            if m4b_path and m4b_path.exists():
+                m4b_path.unlink()
+                self.logger.info(f"Cleaned up {m4b_path}")
                 
     def cmd_regenerate_all(self):
         """Command: regenerate-all - Process all books regardless of current status"""
@@ -308,6 +530,92 @@ class AudiobookPipeline:
                 self.logger.error(f"❌ {slug} - Failed ({failed}/{total_books})")
                 
         self.logger.info(f"Generate-new completed: {successful} successful, {failed} failed")
+    
+    def cmd_generate_mp3_new(self):
+        """Command: generate-mp3-new - Convert M4B files to MP3 where MP3 doesn't exist"""
+        self.logger.info("Starting generate-mp3-new command")
+        
+        # Get all folders in audiobooks bucket
+        folders = self.list_audiobook_folders()
+        if not folders:
+            self.logger.warning("No folders found in audiobooks bucket")
+            return
+        
+        successful = 0
+        failed = 0
+        skipped = 0
+        total_folders = len(folders)
+        
+        self.logger.info(f"Checking {total_folders} folders for MP3 conversion...")
+        
+        for i, slug in enumerate(folders, 1):
+            self.logger.info(f"Processing folder {i}/{total_folders}: {slug}")
+            
+            # Check if MP3 already exists
+            if self.check_mp3_exists(slug):
+                self.logger.info(f"MP3 already exists for {slug}, skipping")
+                skipped += 1
+                continue
+            
+            # Check if M4B exists
+            if not self.check_m4b_exists(slug):
+                self.logger.warning(f"No M4B file found for {slug}, skipping")
+                skipped += 1
+                continue
+            
+            # Process this folder: download M4B, convert to MP3, upload MP3, update database
+            m4b_path = None
+            mp3_path = None
+            
+            try:
+                # Step 1: Download M4B
+                self.logger.info(f"Downloading M4B for {slug}")
+                m4b_path = self.download_m4b_from_bucket(slug)
+                if not m4b_path:
+                    self.logger.error(f"Failed to download M4B for {slug}")
+                    failed += 1
+                    continue
+                
+                # Step 2: Convert M4B to MP3
+                self.logger.info(f"Converting M4B to MP3 for {slug}")
+                mp3_path = self.convert_m4b_to_mp3(m4b_path)
+                if not mp3_path:
+                    self.logger.error(f"Failed to convert M4B to MP3 for {slug}")
+                    failed += 1
+                    continue
+                
+                # Step 3: Upload MP3 to bucket
+                self.logger.info(f"Uploading MP3 for {slug}")
+                mp3_url = self.upload_mp3_to_bucket(slug, mp3_path)
+                if not mp3_url:
+                    self.logger.error(f"Failed to upload MP3 for {slug}")
+                    failed += 1
+                    continue
+                
+                # Step 4: Update database
+                self.logger.info(f"Updating database MP3 URL for {slug}")
+                if not self.update_audiobook_mp3_url(slug, mp3_url):
+                    self.logger.error(f"Failed to update database MP3 URL for {slug}")
+                    failed += 1
+                    continue
+                
+                successful += 1
+                self.logger.info(f"✅ {slug} - MP3 generated successfully ({successful}/{total_folders})")
+                
+            except Exception as e:
+                self.logger.error(f"Error processing MP3 for {slug}: {e}")
+                failed += 1
+                
+            finally:
+                # Clean up temporary files
+                if m4b_path and m4b_path.exists():
+                    m4b_path.unlink()
+                    self.logger.info(f"Cleaned up {m4b_path}")
+                if mp3_path and mp3_path.exists():
+                    mp3_path.unlink()
+                    self.logger.info(f"Cleaned up {mp3_path}")
+        
+        self.logger.info(f"Generate-mp3-new completed: {successful} successful, {failed} failed, {skipped} skipped")
         
     def cmd_generate_single(self, slug: str):
         """Command: generate <slug> - Process a single book by slug"""
@@ -323,7 +631,7 @@ class AudiobookPipeline:
 def main():
     """Main entry point with command routing"""
     parser = argparse.ArgumentParser(description='Audiobook Pipeline Management')
-    parser.add_argument('command', choices=['regenerate-all', 'generate-new', 'generate'], 
+    parser.add_argument('command', choices=['regenerate-all', 'generate-new', 'generate', 'generate-mp3-new'], 
                        help='Command to run')
     parser.add_argument('slug', nargs='?', help='Slug for generate command')
     
@@ -345,6 +653,8 @@ def main():
             pipeline.cmd_generate_new()
         elif args.command == 'generate':
             pipeline.cmd_generate_single(args.slug)
+        elif args.command == 'generate-mp3-new':
+            pipeline.cmd_generate_mp3_new()
     except KeyboardInterrupt:
         pipeline.logger.info("Pipeline interrupted by user")
         sys.exit(1)

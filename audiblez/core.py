@@ -30,6 +30,38 @@ from pick import pick
 sample_rate = 24000
 
 
+def roman_to_arabic(roman):
+    """Convert Roman numerals to Arabic numbers for better pronunciation"""
+    roman_numerals = {
+        'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
+        'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10,
+        'XI': 11, 'XII': 12, 'XIII': 13, 'XIV': 14, 'XV': 15,
+        'XVI': 16, 'XVII': 17, 'XVIII': 18, 'XIX': 19, 'XX': 20,
+        'XXI': 21, 'XXII': 22, 'XXIII': 23, 'XXIV': 24, 'XXV': 25,
+        'XXX': 30, 'XL': 40, 'L': 50, 'LX': 60, 'LXX': 70, 
+        'LXXX': 80, 'XC': 90, 'C': 100
+    }
+    return roman_numerals.get(roman.upper(), None)
+
+
+def convert_roman_numerals_in_text(text):
+    """Convert Roman numerals in text to Arabic numbers for better pronunciation"""
+    import re
+    
+    # Pattern to match Roman numerals at word boundaries
+    roman_pattern = r'\b([IVX]+)\b'
+    
+    def replace_roman(match):
+        roman = match.group(1)
+        # Only convert if it's a valid Roman numeral and not just random letters
+        arabic = roman_to_arabic(roman)
+        if arabic is not None:
+            return str(arabic)
+        return roman  # Return original if not a valid Roman numeral
+    
+    return re.sub(roman_pattern, replace_roman, text)
+
+
 def extract_chapter_title_from_content(text):
     """Extract the actual chapter title from the content"""
     lines = text.strip().split('\n')
@@ -42,7 +74,8 @@ def extract_chapter_title_from_content(text):
             (clean_line.isupper() or clean_line.istitle()) and
             not clean_line.startswith('http') and
             not clean_line.lower().startswith('chapter')):
-            return clean_line
+            # Convert Roman numerals to Arabic numbers for better pronunciation
+            return convert_roman_numerals_in_text(clean_line)
     return None
 
 
@@ -211,11 +244,36 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             # Remove the title from the beginning of content if it matches to avoid duplication
             if chapter_title:
                 lines = text.split('\n')
-                first_line = lines[0].strip().rstrip('.')
-                if first_line.upper() == chapter_title.upper():
-                    # Remove the duplicate first line and clean up
-                    remaining_lines = lines[1:]
-                    text = '\n'.join(remaining_lines).strip()
+                # Get original title (before Roman numeral conversion) for comparison
+                original_title = None
+                for line in lines[:10]:
+                    line_clean = line.strip().rstrip('.')
+                    if (len(line_clean) > 3 and len(line_clean) < 150 and 
+                        (line_clean.isupper() or line_clean.istitle()) and
+                        not line_clean.startswith('http') and
+                        not line_clean.lower().startswith('chapter')):
+                        original_title = line_clean
+                        break
+                
+                # Remove all instances of BOTH original and converted titles from the beginning
+                while lines and lines[0].strip():
+                    line = lines[0].strip().rstrip('.').rstrip(',')
+                    should_remove = False
+                    
+                    # Check against converted title
+                    if line.upper() == chapter_title.upper() or chapter_title.upper() in line.upper():
+                        should_remove = True
+                    
+                    # Check against original title (before Roman numeral conversion)
+                    if original_title and (line.upper() == original_title.upper() or original_title.upper() in line.upper()):
+                        should_remove = True
+                    
+                    if should_remove:
+                        lines.pop(0)  # Remove the duplicate line
+                    else:
+                        break  # Stop when we hit content that's not the title
+                        
+                text = '\n'.join(lines).strip()
             
             text = formatted_announcement + '\n\n...\n\n' + text
         
