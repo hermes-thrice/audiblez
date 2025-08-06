@@ -100,7 +100,7 @@ class AudiobookPipeline:
                 file_data = f.read()
                 
             # Upload file (this will overwrite if exists)
-            response = self.supabase.storage.from_("audiobooks").upload(
+            self.supabase.storage.from_("audiobooks").upload(
                 bucket_path, file_data, {"upsert": "true"}
             )
             
@@ -298,6 +298,103 @@ class AudiobookPipeline:
             self.logger.error(f"Failed to update audiobook_mp3_url for slug '{slug}': {e}")
             return False
     
+    def get_book_id_by_slug(self, slug: str) -> Optional[str]:
+        """Get book UUID from books table by slug"""
+        try:
+            response = self.supabase.table('books').select('id').eq('slug', slug).execute()
+            if response.data and len(response.data) > 0:
+                book_id = response.data[0]['id']
+                self.logger.info(f"Found book_id {book_id} for slug '{slug}'")
+                return book_id
+            else:
+                self.logger.warning(f"No book found with slug '{slug}'")
+                return None
+        except Exception as e:
+            self.logger.error(f"Failed to get book_id for slug '{slug}': {e}")
+            return None
+    
+    def clear_existing_chapters(self, book_id: str) -> bool:
+        """Clear existing chapter data for a book (for regeneration)"""
+        try:
+            self.supabase.table('audiobook_chapters').delete().eq('book_id', book_id).execute()
+            self.logger.info(f"Cleared existing chapters for book_id {book_id}")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to clear existing chapters for book_id {book_id}: {e}")
+            return False
+    
+    def extract_chapter_timing_data(self, chapter_wav_files: List[Path], chapter_titles: List[str]) -> List[Dict]:
+        """Extract chapter timing data from WAV files - similar to create_index_file logic"""
+        try:
+            import subprocess
+            
+            def probe_duration(file_name):
+                args = ['ffprobe', '-i', str(file_name), '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1']
+                proc = subprocess.run(args, capture_output=True, text=True, check=True)
+                return float(proc.stdout.strip())
+            
+            chapter_data = []
+            start_time_sec = 0
+            
+            for i, wav_file in enumerate(chapter_wav_files):
+                if not wav_file.exists():
+                    self.logger.warning(f"WAV file not found: {wav_file}")
+                    continue
+                    
+                duration = probe_duration(wav_file)
+                end_time_sec = start_time_sec + int(duration)
+                
+                # Get chapter title - use provided titles or default
+                chapter_title = chapter_titles[i] if i < len(chapter_titles) else f"Chapter {i}"
+                
+                chapter_info = {
+                    'chapter_number': i + 1,  # 1-indexed
+                    'title': chapter_title,
+                    'start_time_seconds': start_time_sec,
+                    'end_time_seconds': end_time_sec
+                }
+                
+                chapter_data.append(chapter_info)
+                start_time_sec = end_time_sec
+            
+            self.logger.info(f"Extracted timing data for {len(chapter_data)} chapters")
+            return chapter_data
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract chapter timing data: {e}")
+            return []
+    
+    def insert_chapter_data(self, book_id: str, chapter_data: List[Dict]) -> bool:
+        """Insert chapter data into audiobook_chapters table"""
+        try:
+            # Prepare records for batch insert
+            records = []
+            for chapter in chapter_data:
+                record = {
+                    'book_id': book_id,
+                    'chapter_number': chapter['chapter_number'],
+                    'title': chapter['title'],
+                    'start_time_seconds': chapter['start_time_seconds'],
+                    'end_time_seconds': chapter['end_time_seconds']
+                }
+                records.append(record)
+            
+            # Batch insert all chapters
+            response = self.supabase.table('audiobook_chapters').insert(records).execute()
+            
+            if response.data:
+                self.logger.info(f"Successfully inserted {len(records)} chapters for book_id {book_id}")
+                return True
+            else:
+                self.logger.error(f"Failed to insert chapter data - no data returned")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to insert chapter data for book_id {book_id}: {e}")
+            import traceback
+            self.logger.error(f"Chapter insert error traceback: {traceback.format_exc()}")
+            return False
+    
     def generate_and_upload_mp3(self, slug: str, m4b_path: Path) -> bool:
         """Generate MP3 from M4B and upload to bucket, update database"""
         mp3_path = None
@@ -336,8 +433,8 @@ class AudiobookPipeline:
                 self.logger.info(f"Cleaned up {mp3_path}")
             # Note: M4B cleanup is handled by the calling function
             
-    def generate_audiobook(self, epub_path: Path) -> Optional[Path]:
-        """Run audiobook generation command and return path to generated m4b"""
+    def generate_audiobook(self, epub_path: Path) -> tuple[Optional[Path], List[Dict]]:
+        """Run audiobook generation command and return path to generated m4b and chapter data"""
         try:
             # Use absolute path for the command
             abs_epub_path = epub_path.resolve()
@@ -359,20 +456,80 @@ class AudiobookPipeline:
                 m4b_path = epub_path.parent / f"{epub_path.stem}.m4b"
                 if m4b_path.exists():
                     self.logger.info(f"Audiobook generated successfully: {m4b_path}")
-                    return m4b_path
+                    
+                    # Extract chapter data from generated WAV files
+                    chapter_data = self.extract_chapter_data_from_output_dir(abs_epub_path.parent, epub_path.stem)
+                    
+                    return m4b_path, chapter_data
                 else:
                     self.logger.error(f"Command succeeded but m4b file not found: {m4b_path}")
-                    return None
+                    return None, []
             else:
                 self.logger.error(f"Audiobook generation failed: {result.stderr}")
-                return None
+                return None, []
                 
         except subprocess.TimeoutExpired:
             self.logger.error(f"Audiobook generation timed out for {epub_path}")
-            return None
+            return None, []
         except Exception as e:
             self.logger.error(f"Failed to generate audiobook for {epub_path}: {e}")
-            return None
+            return None, []
+    
+    def extract_chapter_data_from_output_dir(self, output_dir: Path, epub_stem: str) -> List[Dict]:
+        """Extract chapter data from the output directory after audiobook generation"""
+        try:
+            # Find all WAV files generated by audiblez
+            wav_pattern = f"{epub_stem}_chapter_*_*.wav"
+            wav_files = list(output_dir.glob(wav_pattern))
+            
+            # Sort by chapter number (extract from filename)
+            def get_chapter_num(wav_file):
+                # File format: {epub_stem}_chapter_{num}_{voice}_{chapter_name}.wav
+                parts = wav_file.stem.split('_chapter_')
+                if len(parts) > 1:
+                    chapter_part = parts[1].split('_')[0]
+                    try:
+                        return int(chapter_part)
+                    except ValueError:
+                        return 999  # Put non-numeric at end
+                return 999
+            
+            wav_files.sort(key=get_chapter_num)
+            
+            if not wav_files:
+                self.logger.warning(f"No WAV files found in {output_dir} with pattern {wav_pattern}")
+                return []
+            
+            # Extract chapter titles from filenames
+            chapter_titles = []
+            for wav_file in wav_files:
+                # Extract title from filename: {epub_stem}_chapter_{num}_{voice}_{chapter_name}.wav
+                parts = wav_file.stem.split('_chapter_')
+                if len(parts) > 1:
+                    # Get everything after the voice part
+                    remaining = parts[1]
+                    voice_and_title = remaining.split('_', 2)  # Split into num, voice, title
+                    if len(voice_and_title) > 2:
+                        title = voice_and_title[2].replace('_', ' ').title()
+                        # Clean up title
+                        if title.endswith('.xhtml'):
+                            title = title[:-6]
+                        chapter_titles.append(title)
+                    else:
+                        chapter_num = get_chapter_num(wav_file)
+                        chapter_titles.append(f"Chapter {chapter_num}")
+                else:
+                    chapter_titles.append("Unknown Chapter")
+            
+            # Use existing function to extract timing data
+            chapter_data = self.extract_chapter_timing_data(wav_files, chapter_titles)
+            
+            self.logger.info(f"Extracted chapter data for {len(chapter_data)} chapters from output directory")
+            return chapter_data
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract chapter data from output dir: {e}")
+            return []
             
     def cleanup_temp_files(self, epub_path: Path, m4b_path: Path = None):
         """Clean up temporary files"""
@@ -410,7 +567,7 @@ class AudiobookPipeline:
                 
             # Step 2: Generate audiobook
             self.logger.info(f"Generating audiobook for {slug}")
-            m4b_path = self.generate_audiobook(epub_path)
+            m4b_path, chapter_data = self.generate_audiobook(epub_path)
             if not m4b_path:
                 self.logger.error(f"Failed to generate audiobook for {slug}")
                 return False
@@ -433,6 +590,21 @@ class AudiobookPipeline:
             if not self.generate_and_upload_mp3(slug, m4b_path):
                 self.logger.warning(f"Failed to generate MP3 for {slug}, but M4B was successful")
                 # Don't return False here - M4B generation was successful
+            
+            # Step 6: Insert chapter data into database
+            if chapter_data:
+                self.logger.info(f"Inserting chapter data for {slug}")
+                book_id = self.get_book_id_by_slug(slug)
+                if book_id:
+                    # Clear existing chapters for regeneration
+                    self.clear_existing_chapters(book_id)
+                    # Insert new chapter data
+                    if not self.insert_chapter_data(book_id, chapter_data):
+                        self.logger.warning(f"Failed to insert chapter data for {slug}, but audiobook generation was successful")
+                else:
+                    self.logger.warning(f"Could not get book_id for {slug}, skipping chapter data insertion")
+            else:
+                self.logger.warning(f"No chapter data extracted for {slug}")
                 
             self.logger.info(f"Successfully processed book: {slug}")
             return True
