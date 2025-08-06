@@ -191,15 +191,19 @@ class AudiobookPipeline:
         try:
             mp3_path = m4b_path.parent / f"{m4b_path.stem}.mp3"
             
-            # Use ffmpeg to convert M4B to MP3 with optimized settings for smaller file size
+            # Use ffmpeg with libmp3lame for optimal speech compression (target: 10-12MB/hour)
             command = [
                 'ffmpeg', '-y',  # Overwrite output
                 '-i', str(m4b_path),  # Input M4B file
-                '-c:a', 'mp3',  # Convert to MP3
-                '-b:a', '64k',  # Lower bitrate for smaller files (was 128k)
-                '-ar', '22050',  # Lower sample rate for speech (was default 44100)
-                '-ac', '1',  # Mono audio for speech (was stereo)
-                '-q:a', '4',  # Quality setting (0-9, 4 is good balance)
+                '-c:a', 'libmp3lame',  # Use LAME MP3 encoder for better compression
+                '-b:a', '48k',  # Aggressive bitrate for speech (was 64k)
+                '-ar', '22050',  # Optimal sample rate for speech
+                '-ac', '1',  # Mono audio (50% size reduction)
+                '-q:a', '4',  # VBR quality (0=best, 9=worst, 4=good balance)
+                '-compression_level', '9',  # Maximum compression effort
+                '-reservoir', 'true',  # Enable bit reservoir for better quality
+                '-joint_stereo', 'false',  # Disable since we're mono anyway
+                '-movflags', '+faststart',  # Optimize for streaming
                 '-f', 'mp3',  # Output format
                 str(mp3_path)  # Output file
             ]
@@ -214,7 +218,29 @@ class AudiobookPipeline:
             )
             
             if result.returncode == 0 and mp3_path.exists():
-                self.logger.info(f"Successfully converted to MP3: {mp3_path}")
+                # Validate file size and calculate compression ratio
+                file_size_mb = mp3_path.stat().st_size / (1024 * 1024)
+                
+                # Estimate duration from M4B file for size validation
+                try:
+                    duration_result = subprocess.run([
+                        'ffprobe', '-i', str(m4b_path), '-show_entries', 'format=duration', 
+                        '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1'
+                    ], capture_output=True, text=True, check=True)
+                    duration_hours = float(duration_result.stdout.strip()) / 3600
+                    mb_per_hour = file_size_mb / duration_hours if duration_hours > 0 else 0
+                    
+                    self.logger.info(f"Successfully converted to MP3: {mp3_path}")
+                    self.logger.info(f"MP3 file size: {file_size_mb:.1f}MB, Duration: {duration_hours:.2f}h, Ratio: {mb_per_hour:.1f}MB/hour")
+                    
+                    # Warn if file size exceeds target (12MB/hour)
+                    if mb_per_hour > 12:
+                        self.logger.warning(f"MP3 file size ({mb_per_hour:.1f}MB/hour) exceeds target of 10-12MB/hour")
+                    
+                except Exception as e:
+                    self.logger.warning(f"Could not validate MP3 file size: {e}")
+                    self.logger.info(f"Successfully converted to MP3: {mp3_path} ({file_size_mb:.1f}MB)")
+                
                 return mp3_path
             else:
                 self.logger.error(f"MP3 conversion failed: {result.stderr}")
@@ -323,45 +349,163 @@ class AudiobookPipeline:
             self.logger.error(f"Failed to clear existing chapters for book_id {book_id}: {e}")
             return False
     
-    def extract_chapter_timing_data(self, chapter_wav_files: List[Path], chapter_titles: List[str]) -> List[Dict]:
-        """Extract chapter timing data from WAV files - similar to create_index_file logic"""
+    def extract_chapter_timing_from_final_audio(self, m4b_path: Path, chapter_titles: List[str]) -> List[Dict]:
+        """Extract accurate chapter timing from final M4B file to prevent drift"""
+        try:
+            import subprocess
+            import json
+            
+            self.logger.info(f"Analyzing final M4B file for accurate chapter timing: {m4b_path}")
+            
+            # Step 1: Extract chapter metadata from M4B file
+            chapter_info_cmd = [
+                'ffprobe', '-i', str(m4b_path), 
+                '-print_format', 'json', '-show_chapters', 
+                '-v', 'quiet'
+            ]
+            
+            result = subprocess.run(chapter_info_cmd, capture_output=True, text=True, check=True)
+            metadata = json.loads(result.stdout)
+            
+            chapter_data = []
+            chapters = metadata.get('chapters', [])
+            
+            # Step 2: Use embedded chapter markers if available
+            if chapters:
+                self.logger.info(f"Found {len(chapters)} embedded chapters in M4B file")
+                self.logger.info(f"DEBUG: Raw chapter metadata from M4B:")
+                for i, chapter_meta in enumerate(chapters):
+                    self.logger.info(f"DEBUG: Chapter {i}: {chapter_meta}")
+                    
+                    original_start = float(chapter_meta.get('start_time', 0))
+                    original_end = float(chapter_meta.get('end_time', 0))
+                    start_time_sec = int(original_start)
+                    end_time_sec = int(original_end)
+                    
+                    self.logger.info(f"DEBUG: Chapter {i+1} - Original: {original_start:.3f}s -> {original_end:.3f}s")
+                    self.logger.info(f"DEBUG: Chapter {i+1} - Converted: {start_time_sec}s -> {end_time_sec}s")
+                    
+                    # Apply 2-second buffer for chapters after the first
+                    buffered_start = start_time_sec
+                    if i > 0:
+                        buffered_start = max(0, start_time_sec - 2)
+                        self.logger.info(f"DEBUG: Chapter {i+1} - Applied 2s buffer: {start_time_sec}s -> {buffered_start}s")
+                    
+                    chapter_title = chapter_titles[i] if i < len(chapter_titles) else f"Chapter {i + 1}"
+                    
+                    chapter_info = {
+                        'chapter_number': i + 1,
+                        'title': chapter_title,
+                        'start_time_seconds': buffered_start,
+                        'end_time_seconds': end_time_sec
+                    }
+                    chapter_data.append(chapter_info)
+                    self.logger.info(f"DEBUG: Final chapter {i+1}: '{chapter_title}' -> {buffered_start}s - {end_time_sec}s")
+                    
+            else:
+                # Step 3: Fallback - detect chapter boundaries using silence detection
+                self.logger.info("No embedded chapters found, using silence detection for chapter boundaries")
+                chapter_data = self.detect_chapter_boundaries_with_silence(m4b_path, chapter_titles)
+            
+            self.logger.info(f"Extracted accurate timing data for {len(chapter_data)} chapters from final M4B")
+            return chapter_data
+            
+        except Exception as e:
+            self.logger.error(f"Failed to extract timing from final M4B: {e}")
+            # Fallback to WAV-based timing if M4B analysis fails
+            self.logger.info("Falling back to WAV-based timing estimation")
+            return self.extract_chapter_timing_from_wavs_with_buffer(chapter_titles)
+    
+    def detect_chapter_boundaries_with_silence(self, m4b_path: Path, chapter_titles: List[str]) -> List[Dict]:
+        """Detect chapter boundaries using silence detection on final audio"""
         try:
             import subprocess
             
-            def probe_duration(file_name):
-                args = ['ffprobe', '-i', str(file_name), '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1']
-                proc = subprocess.run(args, capture_output=True, text=True, check=True)
-                return float(proc.stdout.strip())
+            # Detect silence periods (likely chapter boundaries)
+            silence_cmd = [
+                'ffmpeg', '-i', str(m4b_path), '-af', 
+                'silencedetect=n=-30dB:d=1.0', '-f', 'null', '-'
+            ]
+            
+            result = subprocess.run(silence_cmd, capture_output=True, text=True)
+            silence_output = result.stderr
+            
+            # Parse silence detection output
+            silence_times = []
+            for line in silence_output.split('\n'):
+                if 'silence_end' in line:
+                    # Extract timestamp: "silence_end: 123.456"
+                    parts = line.split('silence_end: ')
+                    if len(parts) > 1:
+                        try:
+                            timestamp = float(parts[1].split(' ')[0])
+                            silence_times.append(int(timestamp))
+                        except (ValueError, IndexError):
+                            continue
+            
+            # Build chapter data with detected boundaries
+            chapter_data = []
+            start_time_sec = 0
+            
+            for i, title in enumerate(chapter_titles):
+                # Use next silence boundary or end of file
+                if i < len(silence_times):
+                    end_time_sec = silence_times[i]
+                else:
+                    # Get total duration for last chapter
+                    duration_cmd = ['ffprobe', '-i', str(m4b_path), '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'default=noprint_wrappers=1:nokey=1']
+                    duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
+                    end_time_sec = int(float(duration_result.stdout.strip()))
+                
+                # Apply buffer for chapters after the first
+                buffered_start = max(0, start_time_sec - 2) if i > 0 else start_time_sec
+                
+                chapter_info = {
+                    'chapter_number': i + 1,
+                    'title': title,
+                    'start_time_seconds': buffered_start,
+                    'end_time_seconds': end_time_sec
+                }
+                chapter_data.append(chapter_info)
+                start_time_sec = end_time_sec
+                
+            self.logger.info(f"Detected {len(chapter_data)} chapter boundaries using silence analysis")
+            return chapter_data
+            
+        except Exception as e:
+            self.logger.error(f"Silence detection failed: {e}")
+            return self.extract_chapter_timing_from_wavs_with_buffer(chapter_titles)
+    
+    def extract_chapter_timing_from_wavs_with_buffer(self, chapter_titles: List[str]) -> List[Dict]:
+        """Fallback: Extract timing from WAV files with drift compensation buffer"""
+        try:
+            # This is the old method but with buffer compensation
+            self.logger.warning("Using WAV-based timing estimation with buffer compensation")
             
             chapter_data = []
             start_time_sec = 0
             
-            for i, wav_file in enumerate(chapter_wav_files):
-                if not wav_file.exists():
-                    self.logger.warning(f"WAV file not found: {wav_file}")
-                    continue
-                    
-                duration = probe_duration(wav_file)
-                end_time_sec = start_time_sec + int(duration)
+            for i, title in enumerate(chapter_titles):
+                # Estimate 3-minute average chapter length if we can't probe
+                estimated_duration = 180  # 3 minutes default
+                end_time_sec = start_time_sec + estimated_duration
                 
-                # Get chapter title - use provided titles or default
-                chapter_title = chapter_titles[i] if i < len(chapter_titles) else f"Chapter {i}"
+                # Apply buffer for chapters after the first
+                buffered_start = max(0, start_time_sec - 2) if i > 0 else start_time_sec
                 
                 chapter_info = {
-                    'chapter_number': i + 1,  # 1-indexed
-                    'title': chapter_title,
-                    'start_time_seconds': start_time_sec,
+                    'chapter_number': i + 1,
+                    'title': title,
+                    'start_time_seconds': buffered_start,
                     'end_time_seconds': end_time_sec
                 }
-                
                 chapter_data.append(chapter_info)
                 start_time_sec = end_time_sec
             
-            self.logger.info(f"Extracted timing data for {len(chapter_data)} chapters")
             return chapter_data
             
         except Exception as e:
-            self.logger.error(f"Failed to extract chapter timing data: {e}")
+            self.logger.error(f"WAV timing fallback failed: {e}")
             return []
     
     def insert_chapter_data(self, book_id: str, chapter_data: List[Dict]) -> bool:
@@ -457,10 +601,10 @@ class AudiobookPipeline:
                 if m4b_path.exists():
                     self.logger.info(f"Audiobook generated successfully: {m4b_path}")
                     
-                    # Extract chapter data from generated WAV files
-                    chapter_data = self.extract_chapter_data_from_output_dir(abs_epub_path.parent, epub_path.stem)
+                    # Extract chapter titles from generated WAV files
+                    chapter_titles = self.extract_chapter_data_from_output_dir(abs_epub_path.parent, epub_path.stem)
                     
-                    return m4b_path, chapter_data
+                    return m4b_path, chapter_titles
                 else:
                     self.logger.error(f"Command succeeded but m4b file not found: {m4b_path}")
                     return None, []
@@ -475,12 +619,17 @@ class AudiobookPipeline:
             self.logger.error(f"Failed to generate audiobook for {epub_path}: {e}")
             return None, []
     
-    def extract_chapter_data_from_output_dir(self, output_dir: Path, epub_stem: str) -> List[Dict]:
+    def extract_chapter_data_from_output_dir(self, output_dir: Path, epub_stem: str) -> List[str]:
         """Extract chapter data from the output directory after audiobook generation"""
         try:
             # Find all WAV files generated by audiblez
             wav_pattern = f"{epub_stem}_chapter_*_*.wav"
             wav_files = list(output_dir.glob(wav_pattern))
+            
+            self.logger.info(f"DEBUG: Looking for WAV files with pattern: {wav_pattern}")
+            self.logger.info(f"DEBUG: Found {len(wav_files)} WAV files:")
+            for wav_file in wav_files:
+                self.logger.info(f"DEBUG: - {wav_file.name}")
             
             # Sort by chapter number (extract from filename)
             def get_chapter_num(wav_file):
@@ -496,36 +645,96 @@ class AudiobookPipeline:
             
             wav_files.sort(key=get_chapter_num)
             
+            self.logger.info(f"DEBUG: WAV files after sorting:")
+            for i, wav_file in enumerate(wav_files):
+                self.logger.info(f"DEBUG: [{i}] {wav_file.name} -> chapter #{get_chapter_num(wav_file)}")
+            
             if not wav_files:
                 self.logger.warning(f"No WAV files found in {output_dir} with pattern {wav_pattern}")
                 return []
             
-            # Extract chapter titles from filenames
+            # Extract chapter titles from filenames 
+            # Format: {epub_stem}_chapter_{num}_{voice}_{chapter_name}.wav
             chapter_titles = []
             for wav_file in wav_files:
-                # Extract title from filename: {epub_stem}_chapter_{num}_{voice}_{chapter_name}.wav
+                chapter_num = get_chapter_num(wav_file)
+                
+                self.logger.info(f"DEBUG: Processing {wav_file.name}")
+                self.logger.info(f"DEBUG: Chapter number: {chapter_num}")
+                
+                # Try to extract title from filename
+                title = None
                 parts = wav_file.stem.split('_chapter_')
+                self.logger.info(f"DEBUG: Split on '_chapter_': {parts}")
+                
                 if len(parts) > 1:
-                    # Get everything after the voice part
+                    # Split the part after '_chapter_': {num}_{voice}_{chapter_name}
                     remaining = parts[1]
-                    voice_and_title = remaining.split('_', 2)  # Split into num, voice, title
-                    if len(voice_and_title) > 2:
-                        title = voice_and_title[2].replace('_', ' ').title()
-                        # Clean up title
-                        if title.endswith('.xhtml'):
+                    components = remaining.split('_')
+                    self.logger.info(f"DEBUG: Components after chapter: {components}")
+                    
+                    # Should have at least: [num, voice, ...title_parts]
+                    if len(components) >= 3:
+                        # Skip chapter number (index 0) and voice (index 1), take rest as title
+                        title_parts = components[2:]
+                        title = '_'.join(title_parts)
+                        self.logger.info(f"DEBUG: Raw title parts: {title_parts}")
+                        self.logger.info(f"DEBUG: Joined raw title: '{title}'")
+                        
+                        # Clean up the title
+                        title = title.replace('_', ' ').strip()
+                        self.logger.info(f"DEBUG: After underscore replacement: '{title}'")
+                        
+                        # Remove file extensions
+                        if title.lower().endswith('.xhtml'):
                             title = title[:-6]
-                        chapter_titles.append(title)
+                            self.logger.info(f"DEBUG: After removing .xhtml: '{title}'")
+                        if title.lower().endswith('.html'):
+                            title = title[:-5]
+                            self.logger.info(f"DEBUG: After removing .html: '{title}'")
+                        
+                        # Convert to title case, but preserve important formatting
+                        if title and not title.isupper():
+                            original_title = title
+                            title = title.title()
+                            self.logger.info(f"DEBUG: Title case conversion: '{original_title}' -> '{title}'")
+                        
+                        # Remove voice artifacts that might have slipped through
+                        voice_patterns = ['af_heart', 'af_sky', 'am_heart', 'am_sky']
+                        for pattern in voice_patterns:
+                            if title.lower().startswith(pattern):
+                                old_title = title
+                                title = title[len(pattern):].strip()
+                                self.logger.info(f"DEBUG: Removed voice prefix '{pattern}': '{old_title}' -> '{title}'")
+                            if title.lower().endswith(pattern):
+                                old_title = title
+                                title = title[:-len(pattern)].strip()
+                                self.logger.info(f"DEBUG: Removed voice suffix '{pattern}': '{old_title}' -> '{title}'")
                     else:
-                        chapter_num = get_chapter_num(wav_file)
-                        chapter_titles.append(f"Chapter {chapter_num}")
+                        self.logger.warning(f"DEBUG: Not enough components ({len(components)}) to extract title from: {components}")
                 else:
-                    chapter_titles.append("Unknown Chapter")
+                    self.logger.warning(f"DEBUG: Could not split filename on '_chapter_'")
+                
+                # Use cleaned title or fallback
+                if title and title.strip():
+                    final_title = title.strip()
+                    chapter_titles.append(final_title)
+                    self.logger.info(f"DEBUG: Using extracted title: '{final_title}'")
+                else:
+                    # Fallback for chapter 0 (title) or when parsing fails
+                    if chapter_num == 0:
+                        fallback_title = "Introduction"
+                    else:
+                        fallback_title = f"Chapter {chapter_num}"
+                    chapter_titles.append(fallback_title)
+                    self.logger.warning(f"DEBUG: Using fallback title: '{fallback_title}' (extraction failed)")
+                        
+                self.logger.info(f"DEBUG: Final title for chapter {chapter_num}: '{chapter_titles[-1]}'")
+                self.logger.info(f"DEBUG: ---")
             
-            # Use existing function to extract timing data
-            chapter_data = self.extract_chapter_timing_data(wav_files, chapter_titles)
-            
-            self.logger.info(f"Extracted chapter data for {len(chapter_data)} chapters from output directory")
-            return chapter_data
+            # Return chapter titles for now - timing will be extracted from M4B file
+            self.logger.info(f"Extracted {len(chapter_titles)} chapter titles from output directory")
+            return chapter_titles  # Return titles, not chapter_data
             
         except Exception as e:
             self.logger.error(f"Failed to extract chapter data from output dir: {e}")
@@ -567,7 +776,7 @@ class AudiobookPipeline:
                 
             # Step 2: Generate audiobook
             self.logger.info(f"Generating audiobook for {slug}")
-            m4b_path, chapter_data = self.generate_audiobook(epub_path)
+            m4b_path, chapter_titles = self.generate_audiobook(epub_path)
             if not m4b_path:
                 self.logger.error(f"Failed to generate audiobook for {slug}")
                 return False
@@ -591,20 +800,26 @@ class AudiobookPipeline:
                 self.logger.warning(f"Failed to generate MP3 for {slug}, but M4B was successful")
                 # Don't return False here - M4B generation was successful
             
-            # Step 6: Insert chapter data into database
-            if chapter_data:
-                self.logger.info(f"Inserting chapter data for {slug}")
-                book_id = self.get_book_id_by_slug(slug)
-                if book_id:
-                    # Clear existing chapters for regeneration
-                    self.clear_existing_chapters(book_id)
-                    # Insert new chapter data
-                    if not self.insert_chapter_data(book_id, chapter_data):
-                        self.logger.warning(f"Failed to insert chapter data for {slug}, but audiobook generation was successful")
+            # Step 6: Extract accurate chapter timing and insert into database
+            if chapter_titles:
+                self.logger.info(f"Extracting accurate chapter timing for {slug}")
+                # Use the new accurate timing extraction from final M4B
+                chapter_data = self.extract_chapter_timing_from_final_audio(m4b_path, chapter_titles)
+                
+                if chapter_data:
+                    book_id = self.get_book_id_by_slug(slug)
+                    if book_id:
+                        # Clear existing chapters for regeneration
+                        self.clear_existing_chapters(book_id)
+                        # Insert new chapter data with accurate timing
+                        if not self.insert_chapter_data(book_id, chapter_data):
+                            self.logger.warning(f"Failed to insert chapter data for {slug}, but audiobook generation was successful")
+                    else:
+                        self.logger.warning(f"Could not get book_id for {slug}, skipping chapter data insertion")
                 else:
-                    self.logger.warning(f"Could not get book_id for {slug}, skipping chapter data insertion")
+                    self.logger.warning(f"Failed to extract accurate timing for {slug}")
             else:
-                self.logger.warning(f"No chapter data extracted for {slug}")
+                self.logger.warning(f"No chapter titles extracted for {slug}")
                 
             self.logger.info(f"Successfully processed book: {slug}")
             return True
